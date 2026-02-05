@@ -1,0 +1,251 @@
+---
+pcx_content_type: concept
+title: Snapshots
+sidebar:
+  order: 3
+---
+
+import { TypeScriptExample } from "~/components";
+
+Container snapshots capture the state of specific directories, allowing you to persist and restore data across container restarts. Use snapshots to preserve expensive setup operations like `git clone` or `npm install`, reducing startup time from minutes to sub-second.
+
+## How snapshots work
+
+When a container goes to sleep or is manually triggered, Cloudflare captures the contents of specified directories and stores them. When the container restarts, either with the same or a different instance, these snapshots restore the directories to their saved state.
+
+Snapshots are stored in [R2](/r2/) and billed at R2 storage rates. You control how long snapshots persist through TTL (time-to-live) settings.
+
+### Key characteristics
+
+- **Resume speed** - Restoring a snapshot is substantially faster than re-fetching files via `git clone` or `npm install`, with sub-second p90 resume times for typical workloads
+- **Write performance** - Optimized for development workflows including package installations, git operations, and writing code, but not database-level throughput
+- **Persistence cadence** - Snapshots are captured on sleep or manual trigger, not on every write. Data written between snapshots may be lost if the container terminates unexpectedly.
+- **Image compatibility** - Directory snapshots work across container image updates, so updating your base image does not invalidate your snapshots
+
+## Automatic directory snapshots
+
+Configure directories to snapshot automatically when your container goes to sleep. Define the `directorySnapshots` property on your Container class:
+
+<TypeScriptExample filename="src/index.ts">
+```ts
+import { Container } from "@cloudflare/containers";
+
+export class MyContainer extends Container<Env> {
+  sleepAfter = "30m";
+
+directorySnapshots = [
+{ path: "/workspace", ttl: "5d" },
+{ path: "/home/user" }, // No TTL means indefinite retention
+];
+}
+
+````
+</TypeScriptExample>
+
+Each directory snapshot configuration accepts:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `path` | `string` | Absolute path to the directory to snapshot |
+| `ttl` | `string` | Optional. How long to retain the snapshot. Omit for indefinite retention. |
+
+When the container sleeps (after 30 minutes of inactivity in this example), Cloudflare automatically snapshots the specified directories. The next time this container instance starts, the directories restore to their saved state.
+
+### TTL format
+
+TTLs use duration strings with the following units:
+
+- `s` - seconds (for example, `30s`)
+- `m` - minutes (for example, `10m`)
+- `h` - hours (for example, `2h`)
+- `d` - days (for example, `5d`)
+
+Omitting the TTL retains the snapshot indefinitely. You are charged R2 storage rates for the duration the snapshot exists.
+
+## Manual snapshots
+
+Use manual snapshots for finer control over when directory state is captured. This is useful for checkpointing progress, creating restore points before risky operations, or persisting state at specific application milestones.
+
+### Create a snapshot
+
+Call `snapshotDirectory()` on a container instance to capture the current state of a directory:
+
+<TypeScriptExample filename="src/index.ts">
+```ts
+import { getContainer } from "@cloudflare/containers";
+
+export default {
+  async fetch(request: Request, env: Env) {
+    const instance = getContainer(env.MY_CONTAINER, "user-123");
+
+    // Run setup that modifies the filesystem
+    await instance.fetch(new Request("http://container/setup"));
+
+    // Snapshot the directory after setup completes
+    const snapshot = await instance.snapshotDirectory("/workspace", {
+      ttl: "5d",
+    });
+
+    // snapshot.id can be stored and used later
+    return Response.json({ snapshotId: snapshot.id });
+  },
+};
+````
+
+</TypeScriptExample>
+
+The `snapshotDirectory()` method accepts:
+
+| Parameter     | Type     | Description                                |
+| ------------- | -------- | ------------------------------------------ |
+| `path`        | `string` | Absolute path to the directory to snapshot |
+| `options.ttl` | `string` | Optional. How long to retain the snapshot. |
+
+### Restore a snapshot
+
+Call `applySnapshot()` to restore a directory to a previously captured state:
+
+<TypeScriptExample filename="src/index.ts">
+```ts
+import { getContainer } from "@cloudflare/containers";
+
+export default {
+  async fetch(request: Request, env: Env) {
+    const { snapshotId } = await request.json();
+    const instance = getContainer(env.MY_CONTAINER, "user-123");
+
+    // Restore the directory to the snapshot state
+    await instance.applySnapshot(snapshotId);
+
+    // Continue with the restored filesystem
+    return instance.fetch(request);
+
+},
+};
+
+````
+</TypeScriptExample>
+
+### Restore to a different instance
+
+Apply a snapshot to a different container instance to fork state or migrate work between sessions:
+
+<TypeScriptExample filename="src/index.ts">
+```ts
+import { getContainer } from "@cloudflare/containers";
+
+export default {
+  async fetch(request: Request, env: Env) {
+    const { snapshotId, targetInstanceId } = await request.json();
+
+    // Apply the snapshot to a different instance
+    const targetInstance = getContainer(env.MY_CONTAINER, targetInstanceId);
+    await targetInstance.applySnapshot(snapshotId);
+
+    return targetInstance.fetch(request);
+  },
+};
+````
+
+</TypeScriptExample>
+
+:::note
+Snapshot forking applies the captured directory state to any instance. The instances do not share live state or synchronize changes after the snapshot is applied.
+:::
+
+## Use cases
+
+### Development environments
+
+Snapshot `/workspace` or project directories to preserve cloned repositories and installed dependencies:
+
+<TypeScriptExample filename="src/index.ts">
+```ts
+import { Container } from "@cloudflare/containers";
+
+export class DevContainer extends Container<Env> {
+  sleepAfter = "30m";
+
+directorySnapshots = [
+{ path: "/workspace", ttl: "7d" },
+{ path: "/home/developer/.npm", ttl: "7d" },
+{ path: "/home/developer/.cache", ttl: "7d" },
+];
+}
+
+````
+</TypeScriptExample>
+
+### AI agent workspaces
+
+Preserve agent state and generated artifacts between sessions:
+
+<TypeScriptExample filename="src/index.ts">
+```ts
+import { Container } from "@cloudflare/containers";
+
+export class AgentContainer extends Container<Env> {
+  sleepAfter = "15m";
+
+  directorySnapshots = [
+    { path: "/agent/workspace" },
+    { path: "/agent/memory" },
+  ];
+}
+````
+
+</TypeScriptExample>
+
+### Checkpoint and rollback
+
+Create checkpoints before running potentially destructive operations:
+
+<TypeScriptExample filename="src/index.ts">
+```ts
+import { getContainer } from "@cloudflare/containers";
+
+export default {
+  async fetch(request: Request, env: Env) {
+    const instance = getContainer(env.MY_CONTAINER, "project-123");
+
+    // Create a checkpoint before risky operation
+    const checkpoint = await instance.snapshotDirectory("/workspace", {
+      ttl: "1h",
+    });
+
+    try {
+      await instance.fetch(new Request("http://container/risky-operation"));
+      return new Response("Operation completed");
+    } catch (error) {
+      // Rollback on failure
+      await instance.applySnapshot(checkpoint.id);
+      return new Response("Operation failed, rolled back", { status: 500 });
+    }
+
+},
+};
+
+```
+</TypeScriptExample>
+
+## Pricing
+
+Snapshots are stored in R2 and billed at [R2 storage rates](/r2/pricing/). You are charged for:
+
+- **Storage** - The size of each snapshot for the duration it exists
+- **Operations** - Creating and restoring snapshots
+
+Set appropriate TTLs to control costs. Snapshots without a TTL persist indefinitely and continue to incur storage charges until manually deleted.
+
+## Limitations
+
+- Snapshots capture directory contents only, not running process state or memory
+- Data written between snapshot captures is not persisted
+- Snapshots are scoped to individual directories, not the full filesystem
+
+## Related resources
+
+- [Container lifecycle](/containers/platform-details/architecture/) - Understand when containers sleep and restart
+- [R2 pricing](/r2/pricing/) - Storage rates for snapshot data
+- [Container package](/containers/container-package/) - Full API reference for the Container class
+```
